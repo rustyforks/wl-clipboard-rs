@@ -16,7 +16,7 @@ use wayland_protocols::wlr::unstable::data_control::v1::client::zwlr_data_contro
 
 use crate::{
     common::{self, initialize, CommonData},
-    handlers::DataDeviceHandler,
+    handlers::{data_device_handler, DataDeviceHandler},
     seat_data::SeatData,
     utils::is_text,
 };
@@ -146,13 +146,15 @@ fn get_offer(primary: bool,
 
     // Go through the seats and get their data devices.
     for seat in &*seats.borrow_mut() {
-        let handler = DataDeviceHandler::new(seat.clone(), primary, supports_primary.clone());
-        clipboard_manager.get_data_device(seat, |device| device.implement(handler, ()))
-                         .unwrap();
+        let mut handler = DataDeviceHandler::new(seat.detach(), primary, supports_primary.clone());
+        let device = clipboard_manager.get_data_device(seat);
+        device.quick_assign(move |data_device, event, dispatch_data| {
+                  data_device_handler(&mut handler, data_device, event, dispatch_data)
+              });
     }
 
     // Retrieve all seat names and offers.
-    queue.sync_roundtrip()
+    queue.sync_roundtrip(&mut (), |_, _, _| {})
          .map_err(Error::WaylandCommunication)?;
 
     // Check if the compositor supports primary selection.
@@ -165,7 +167,8 @@ fn get_offer(primary: bool,
                      .iter()
                      .map(|seat| {
                          seat.as_ref()
-                             .user_data::<RefCell<SeatData>>()
+                             .user_data()
+                             .get::<RefCell<SeatData>>()
                              .unwrap()
                              .borrow()
                      })
@@ -230,7 +233,8 @@ pub(crate) fn get_mime_types_internal(clipboard: ClipboardType,
     let (_, offer) = get_offer(primary, seat, socket_name)?;
 
     let mut mime_types = offer.as_ref()
-                              .user_data::<RefCell<HashSet<String>>>()
+                              .user_data()
+                              .get::<RefCell<HashSet<String>>>()
                               .unwrap()
                               .borrow_mut();
 
@@ -294,7 +298,8 @@ pub(crate) fn get_contents_internal(clipboard: ClipboardType,
     let (mut queue, offer) = get_offer(primary, seat, socket_name)?;
 
     let mut mime_types = offer.as_ref()
-                              .user_data::<RefCell<HashSet<String>>>()
+                              .user_data()
+                              .get::<RefCell<HashSet<String>>>()
                               .unwrap()
                               .borrow_mut();
 
@@ -329,7 +334,7 @@ pub(crate) fn get_contents_internal(clipboard: ClipboardType,
     // Start the transfer.
     offer.receive(mime_type.clone(), write.as_raw_fd());
     drop(write);
-    queue.sync_roundtrip()
+    queue.sync_roundtrip(&mut (), |_, _, _| {})
          .map_err(Error::WaylandCommunication)?;
 
     Ok((read, mime_type))

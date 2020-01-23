@@ -16,60 +16,49 @@ use wayland_protocols::wlr::unstable::data_control::v1::server::{
         Request as ServerDeviceRequest, ZwlrDataControlDeviceV1 as ServerDevice,
     },
     zwlr_data_control_manager_v1::{
-        RequestHandler as ServerManagerRequestHandler, ZwlrDataControlManagerV1 as ServerManager,
+        Request as ServerManagerRequest, ZwlrDataControlManagerV1 as ServerManager,
     },
     zwlr_data_control_source_v1::{
         Request as ServerSourceRequest, ZwlrDataControlSourceV1 as ServerSource,
     },
 };
-use wayland_server::{protocol::wl_seat::WlSeat as ServerSeat, NewResource};
+use wayland_server::{protocol::wl_seat::WlSeat as ServerSeat, Main};
 
 use crate::{copy::*, tests::TestServer};
 
 #[test]
 fn clear_test() {
-    struct ServerManagerHandler {
-        pass: Rc<Cell<bool>>,
-    }
-
-    impl ServerManagerRequestHandler for ServerManagerHandler {
-        fn get_data_device(&mut self,
-                           _manager: ServerManager,
-                           id: NewResource<ServerDevice>,
-                           _seat: ServerSeat) {
-            let pass = self.pass.clone();
-            id.implement_closure(move |request, _| {
-                                     if let ServerDeviceRequest::SetSelection { source: None } =
-                                         request
-                                     {
-                                         pass.set(true);
-                                     }
-                                 },
-                                 None::<fn(_)>,
-                                 ());
-        }
-    }
-
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
 
     let pass = Rc::new(Cell::new(false));
     {
         let pass = pass.clone();
         server.display
-              .create_global::<ServerManager, _>(1, move |new_res, _| {
-                  new_res.implement(ServerManagerHandler { pass: pass.clone() },
-                                    None::<fn(_)>,
-                                    ());
+              .create_global::<ServerManager, _>(1, move |manager, _, _| {
+                  let pass = pass.clone();
+                  manager.quick_assign(move |_, request, _| {
+                             if let ServerManagerRequest::GetDataDevice { id, .. } = request {
+                                 let pass = pass.clone();
+                                 id.quick_assign(move |_, request, _| {
+                                       if let ServerDeviceRequest::SetSelection { source: None } =
+                                           request
+                                       {
+                                           pass.set(true);
+                                       }
+                                   });
+                             }
+                         });
               });
     }
 
     let socket_name = mem::replace(&mut server.socket_name, OsString::new());
     let child =
         thread::spawn(move || clear_internal(ClipboardType::Regular, Seat::All, Some(socket_name)));
+
+    thread::sleep(Duration::from_millis(100));
+    server.answer();
 
     thread::sleep(Duration::from_millis(100));
     server.answer();
@@ -91,50 +80,52 @@ fn copy_test() {
         selection: Rc<RefCell<Option<ServerSource>>>,
     }
 
-    impl ServerManagerRequestHandler for ServerManagerHandler {
-        fn create_data_source(&mut self, _manager: ServerManager, id: NewResource<ServerSource>) {
-            id.implement_closure(|request, source| {
-                                     if let ServerSourceRequest::Offer { mime_type } = request {
-                                         source.as_ref()
-                                               .user_data::<RefCell<Vec<_>>>()
-                                               .unwrap()
-                                               .borrow_mut()
-                                               .push(mime_type);
-                                     }
-                                 },
-                                 None::<fn(_)>,
-                                 RefCell::new(Vec::<String>::new()));
+    impl ServerManagerHandler {
+        fn create_data_source(&mut self, id: Main<ServerSource>) {
+            id.as_ref()
+              .user_data()
+              .set(|| RefCell::new(Vec::<String>::new()));
+            id.quick_assign(|source, request, _| {
+                  if let ServerSourceRequest::Offer { mime_type } = request {
+                      source.as_ref()
+                            .user_data()
+                            .get::<RefCell<Vec<_>>>()
+                            .unwrap()
+                            .borrow_mut()
+                            .push(mime_type);
+                  }
+              });
         }
 
-        fn get_data_device(&mut self,
-                           _manager: ServerManager,
-                           id: NewResource<ServerDevice>,
-                           _seat: ServerSeat) {
+        fn get_data_device(&mut self, id: Main<ServerDevice>) {
             let selection = self.selection.clone();
-            id.implement_closure(move |request, _| {
-                                     if let ServerDeviceRequest::SetSelection { source } = request {
-                                         *selection.borrow_mut() = source;
-                                     }
-                                 },
-                                 None::<fn(_)>,
-                                 ());
+            id.quick_assign(move |_, request, _| {
+                  if let ServerDeviceRequest::SetSelection { source } = request {
+                      *selection.borrow_mut() = source;
+                  }
+              });
         }
     }
 
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
 
     let selection = Rc::new(RefCell::new(None));
     {
         let selection = selection.clone();
         server.display
-              .create_global::<ServerManager, _>(1, move |new_res, _| {
-                  new_res.implement(ServerManagerHandler { selection: selection.clone() },
-                                    None::<fn(_)>,
-                                    ());
+              .create_global::<ServerManager, _>(1, move |manager, _, _| {
+                  let mut handler = ServerManagerHandler { selection: selection.clone() };
+                  manager.quick_assign(move |_, request, _| match request {
+                             ServerManagerRequest::CreateDataSource { id } => {
+                                 handler.create_data_source(id)
+                             }
+                             ServerManagerRequest::GetDataDevice { id, .. } => {
+                                 handler.get_data_device(id)
+                             }
+                             _ => unreachable!(),
+                         });
               });
     }
 
@@ -156,9 +147,13 @@ fn copy_test() {
     thread::sleep(Duration::from_millis(100));
     server.answer();
 
+    thread::sleep(Duration::from_millis(100));
+    server.answer();
+
     let mime_types = selection.borrow().as_ref().map(|x| {
                                                     x.as_ref()
-                                                     .user_data::<RefCell<Vec<String>>>()
+                                                     .user_data()
+                                                     .get::<RefCell<Vec<String>>>()
                                                      .unwrap()
                                                      .borrow()
                                                      .clone()
@@ -190,50 +185,52 @@ fn copy_multi_test() {
         selection: Rc<RefCell<Option<ServerSource>>>,
     }
 
-    impl ServerManagerRequestHandler for ServerManagerHandler {
-        fn create_data_source(&mut self, _manager: ServerManager, id: NewResource<ServerSource>) {
-            id.implement_closure(|request, source| {
-                                     if let ServerSourceRequest::Offer { mime_type } = request {
-                                         source.as_ref()
-                                               .user_data::<RefCell<Vec<_>>>()
-                                               .unwrap()
-                                               .borrow_mut()
-                                               .push(mime_type);
-                                     }
-                                 },
-                                 None::<fn(_)>,
-                                 RefCell::new(Vec::<String>::new()));
+    impl ServerManagerHandler {
+        fn create_data_source(&mut self, id: Main<ServerSource>) {
+            id.as_ref()
+              .user_data()
+              .set(|| RefCell::new(Vec::<String>::new()));
+            id.quick_assign(|source, request, _| {
+                  if let ServerSourceRequest::Offer { mime_type } = request {
+                      source.as_ref()
+                            .user_data()
+                            .get::<RefCell<Vec<_>>>()
+                            .unwrap()
+                            .borrow_mut()
+                            .push(mime_type);
+                  }
+              });
         }
 
-        fn get_data_device(&mut self,
-                           _manager: ServerManager,
-                           id: NewResource<ServerDevice>,
-                           _seat: ServerSeat) {
+        fn get_data_device(&mut self, id: Main<ServerDevice>) {
             let selection = self.selection.clone();
-            id.implement_closure(move |request, _| {
-                                     if let ServerDeviceRequest::SetSelection { source } = request {
-                                         *selection.borrow_mut() = source;
-                                     }
-                                 },
-                                 None::<fn(_)>,
-                                 ());
+            id.quick_assign(move |_, request, _| {
+                  if let ServerDeviceRequest::SetSelection { source } = request {
+                      *selection.borrow_mut() = source;
+                  }
+              });
         }
     }
 
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
 
     let selection = Rc::new(RefCell::new(None));
     {
         let selection = selection.clone();
         server.display
-              .create_global::<ServerManager, _>(1, move |new_res, _| {
-                  new_res.implement(ServerManagerHandler { selection: selection.clone() },
-                                    None::<fn(_)>,
-                                    ());
+              .create_global::<ServerManager, _>(1, move |manager, _, _| {
+                  let mut handler = ServerManagerHandler { selection: selection.clone() };
+                  manager.quick_assign(move |_, request, _| match request {
+                             ServerManagerRequest::CreateDataSource { id } => {
+                                 handler.create_data_source(id)
+                             }
+                             ServerManagerRequest::GetDataDevice { id, .. } => {
+                                 handler.get_data_device(id)
+                             }
+                             _ => unreachable!(),
+                         });
               });
     }
 
@@ -266,9 +263,13 @@ fn copy_multi_test() {
     thread::sleep(Duration::from_millis(100));
     server.answer();
 
+    thread::sleep(Duration::from_millis(100));
+    server.answer();
+
     let mime_types = selection.borrow().as_ref().map(|x| {
                                                     x.as_ref()
-                                                     .user_data::<RefCell<Vec<String>>>()
+                                                     .user_data()
+                                                     .get::<RefCell<Vec<String>>>()
                                                      .unwrap()
                                                      .borrow()
                                                      .clone()
@@ -336,50 +337,52 @@ fn copy_large() {
         selection: Rc<RefCell<Option<ServerSource>>>,
     }
 
-    impl ServerManagerRequestHandler for ServerManagerHandler {
-        fn create_data_source(&mut self, _manager: ServerManager, id: NewResource<ServerSource>) {
-            id.implement_closure(|request, source| {
-                                     if let ServerSourceRequest::Offer { mime_type } = request {
-                                         source.as_ref()
-                                               .user_data::<RefCell<Vec<_>>>()
-                                               .unwrap()
-                                               .borrow_mut()
-                                               .push(mime_type);
-                                     }
-                                 },
-                                 None::<fn(_)>,
-                                 RefCell::new(Vec::<String>::new()));
+    impl ServerManagerHandler {
+        fn create_data_source(&mut self, id: Main<ServerSource>) {
+            id.as_ref()
+              .user_data()
+              .set(|| RefCell::new(Vec::<String>::new()));
+            id.quick_assign(|source, request, _| {
+                  if let ServerSourceRequest::Offer { mime_type } = request {
+                      source.as_ref()
+                            .user_data()
+                            .get::<RefCell<Vec<_>>>()
+                            .unwrap()
+                            .borrow_mut()
+                            .push(mime_type);
+                  }
+              });
         }
 
-        fn get_data_device(&mut self,
-                           _manager: ServerManager,
-                           id: NewResource<ServerDevice>,
-                           _seat: ServerSeat) {
+        fn get_data_device(&mut self, id: Main<ServerDevice>) {
             let selection = self.selection.clone();
-            id.implement_closure(move |request, _| {
-                                     if let ServerDeviceRequest::SetSelection { source } = request {
-                                         *selection.borrow_mut() = source;
-                                     }
-                                 },
-                                 None::<fn(_)>,
-                                 ());
+            id.quick_assign(move |_, request, _| {
+                  if let ServerDeviceRequest::SetSelection { source } = request {
+                      *selection.borrow_mut() = source;
+                  }
+              });
         }
     }
 
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
 
     let selection = Rc::new(RefCell::new(None));
     {
         let selection = selection.clone();
         server.display
-              .create_global::<ServerManager, _>(1, move |new_res, _| {
-                  new_res.implement(ServerManagerHandler { selection: selection.clone() },
-                                    None::<fn(_)>,
-                                    ());
+              .create_global::<ServerManager, _>(1, move |manager, _, _| {
+                  let mut handler = ServerManagerHandler { selection: selection.clone() };
+                  manager.quick_assign(move |_, request, _| match request {
+                             ServerManagerRequest::CreateDataSource { id } => {
+                                 handler.create_data_source(id)
+                             }
+                             ServerManagerRequest::GetDataDevice { id, .. } => {
+                                 handler.get_data_device(id)
+                             }
+                             _ => unreachable!(),
+                         });
               });
     }
 
@@ -394,6 +397,9 @@ fn copy_large() {
             copy_internal(opts, sources, Some(socket_name))
         })
     };
+
+    thread::sleep(Duration::from_millis(100));
+    server.answer();
 
     thread::sleep(Duration::from_millis(100));
     server.answer();

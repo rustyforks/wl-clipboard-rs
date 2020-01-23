@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     io::{Read, Write},
     mem,
-    os::unix::io::{FromRawFd, RawFd},
+    os::unix::io::FromRawFd,
     thread,
     time::Duration,
 };
@@ -14,7 +14,7 @@ use wayland_protocols::wlr::unstable::data_control::v1::server::{
         Request as ServerManagerRequest, ZwlrDataControlManagerV1 as ServerManager,
     },
     zwlr_data_control_offer_v1::{
-        RequestHandler as ServerOfferRequestHandler, ZwlrDataControlOfferV1 as ServerOffer,
+        Request as ServerOfferRequest, ZwlrDataControlOfferV1 as ServerOffer,
     },
 };
 use wayland_server::protocol::wl_seat::WlSeat as ServerSeat;
@@ -25,38 +25,34 @@ use crate::{paste::*, tests::TestServer};
 fn get_mime_types_test() {
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
     server.display
-          .create_global::<ServerManager, _>(1, |new_res, _| {
-              new_res.implement_closure(|request, _| match request {
-                                            ServerManagerRequest::GetDataDevice { id, .. } => {
-                                                let device = id.implement_dummy();
-                                                let offer =
-                                             device.as_ref()
-                                                   .client()
-                                                   .unwrap()
-                                                   .create_resource::<ServerOffer>(device.as_ref()
-                                                                                         .version())
-                                                   .unwrap()
-                                                   .implement_dummy();
-                                                device.data_offer(&offer);
-                                                offer.offer("first".to_string());
-                                                offer.offer("second".to_string());
-                                                offer.offer("third".to_string());
-                                                device.selection(Some(&offer));
-                                            }
-                                            _ => unreachable!(),
-                                        },
-                                        None::<fn(_)>,
-                                        ());
+          .create_global::<ServerManager, _>(1, |manager, _, _| {
+              manager.quick_assign(move |_, request, _| match request {
+                         ServerManagerRequest::GetDataDevice { id: device, .. } => {
+                             let offer =
+                                 device.as_ref()
+                                       .client()
+                                       .unwrap()
+                                       .create_resource::<ServerOffer>(device.as_ref().version())
+                                       .unwrap();
+                             device.data_offer(&offer);
+                             offer.offer("first".to_string());
+                             offer.offer("second".to_string());
+                             offer.offer("third".to_string());
+                             device.selection(Some(&offer));
+                         }
+                         _ => unreachable!(),
+                     });
           });
 
     let socket_name = mem::replace(&mut server.socket_name, OsString::new());
     let child = thread::spawn(move || {
         get_mime_types_internal(ClipboardType::Regular, Seat::Unspecified, Some(socket_name))
     });
+
+    thread::sleep(Duration::from_millis(100));
+    server.answer();
 
     thread::sleep(Duration::from_millis(100));
     server.answer();
@@ -77,9 +73,7 @@ fn get_mime_types_test() {
 fn get_mime_types_no_data_control() {
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
 
     let socket_name = mem::replace(&mut server.socket_name, OsString::new());
     let child = thread::spawn(move || {
@@ -105,9 +99,7 @@ fn get_mime_types_no_data_control() {
 fn get_mime_types_no_data_control_2() {
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
 
     let socket_name = mem::replace(&mut server.socket_name, OsString::new());
     let child = thread::spawn(move || {
@@ -133,9 +125,7 @@ fn get_mime_types_no_data_control_2() {
 fn get_mime_types_no_seats() {
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerManager, _>(1, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerManager, _>(1, |_, _, _| {});
 
     let socket_name = mem::replace(&mut server.socket_name, OsString::new());
     let child = thread::spawn(move || {
@@ -160,26 +150,24 @@ fn get_mime_types_no_seats() {
 fn get_mime_types_empty_clipboard() {
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
     server.display
-          .create_global::<ServerManager, _>(1, |new_res, _| {
-              new_res.implement_closure(|request, _| match request {
-                                            ServerManagerRequest::GetDataDevice { id, .. } => {
-                                                let device = id.implement_dummy();
-                                                device.selection(None);
-                                            }
-                                            _ => unreachable!(),
-                                        },
-                                        None::<fn(_)>,
-                                        ());
+          .create_global::<ServerManager, _>(1, |manager, _, _| {
+              manager.quick_assign(|_, request, _| match request {
+                         ServerManagerRequest::GetDataDevice { id: device, .. } => {
+                             device.selection(None);
+                         }
+                         _ => unreachable!(),
+                     });
           });
 
     let socket_name = mem::replace(&mut server.socket_name, OsString::new());
     let child = thread::spawn(move || {
         get_mime_types_internal(ClipboardType::Regular, Seat::Unspecified, Some(socket_name))
     });
+
+    thread::sleep(Duration::from_millis(100));
+    server.answer();
 
     thread::sleep(Duration::from_millis(100));
     server.answer();
@@ -197,42 +185,31 @@ fn get_mime_types_empty_clipboard() {
 
 #[test]
 fn get_contents_test() {
-    struct ServerOfferHandler;
-    impl ServerOfferRequestHandler for ServerOfferHandler {
-        fn receive(&mut self, _offer: ServerOffer, _mime_type: String, fd: RawFd) {
-            let mut write = unsafe { PipeWriter::from_raw_fd(fd) };
-            let _ = write.write_all(&[1, 3, 3, 7]);
-        }
-    }
-
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
     server.display
-          .create_global::<ServerManager, _>(1, |new_res, _| {
-              new_res.implement_closure(|request, _| match request {
-                                            ServerManagerRequest::GetDataDevice { id, .. } => {
-                                                let device = id.implement_dummy();
-                                                let offer =
-                                             device.as_ref()
-                                                   .client()
-                                                   .unwrap()
-                                                   .create_resource::<ServerOffer>(device.as_ref()
-                                                                                         .version())
-                                                   .unwrap()
-                                                   .implement(ServerOfferHandler,
-                                                              None::<fn(_)>,
-                                                              ());
-                                                device.data_offer(&offer);
-                                                offer.offer("application/octet-stream".to_string());
-                                                device.selection(Some(&offer));
-                                            }
-                                            _ => unreachable!(),
-                                        },
-                                        None::<fn(_)>,
-                                        ());
+          .create_global::<ServerManager, _>(1, |manager, _, _| {
+              manager.quick_assign(move |_, request, _| match request {
+                         ServerManagerRequest::GetDataDevice { id: device, .. } => {
+                             let offer =
+                                 device.as_ref()
+                                       .client()
+                                       .unwrap()
+                                       .create_resource::<ServerOffer>(device.as_ref().version())
+                                       .unwrap();
+                             offer.quick_assign(|_, request, _| {
+                                      if let ServerOfferRequest::Receive { fd, .. } = request {
+                                          let mut write = unsafe { PipeWriter::from_raw_fd(fd) };
+                                          let _ = write.write_all(&[1, 3, 3, 7]);
+                                      }
+                                  });
+                             device.data_offer(&offer);
+                             offer.offer("application/octet-stream".to_string());
+                             device.selection(Some(&offer));
+                         }
+                         _ => unreachable!(),
+                     });
           });
 
     let socket_name = mem::replace(&mut server.socket_name, OsString::new());
@@ -242,6 +219,9 @@ fn get_contents_test() {
                               MimeType::Any,
                               Some(socket_name))
     });
+
+    thread::sleep(Duration::from_millis(100));
+    server.answer();
 
     thread::sleep(Duration::from_millis(100));
     server.answer();
@@ -264,30 +244,29 @@ fn get_contents_test() {
 fn get_contents_wrong_mime_type() {
     let mut server = TestServer::new();
     server.display
-          .create_global::<ServerSeat, _>(6, |new_res, _| {
-              new_res.implement_dummy();
-          });
+          .create_global::<ServerSeat, _>(6, |_, _, _| {});
     server.display
-          .create_global::<ServerManager, _>(1, |new_res, _| {
-              new_res.implement_closure(|request, _| match request {
-                                            ServerManagerRequest::GetDataDevice { id, .. } => {
-                                                let device = id.implement_dummy();
-                                                let offer =
-                                             device.as_ref()
-                                                   .client()
-                                                   .unwrap()
-                                                   .create_resource::<ServerOffer>(device.as_ref()
-                                                                                         .version())
-                                                   .unwrap()
-                                                   .implement_dummy();
-                                                device.data_offer(&offer);
-                                                offer.offer("application/octet-stream".to_string());
-                                                device.selection(Some(&offer));
-                                            }
-                                            _ => unreachable!(),
-                                        },
-                                        None::<fn(_)>,
-                                        ());
+          .create_global::<ServerManager, _>(1, |manager, _, _| {
+              manager.quick_assign(move |_, request, _| match request {
+                         ServerManagerRequest::GetDataDevice { id: device, .. } => {
+                             let offer =
+                                 device.as_ref()
+                                       .client()
+                                       .unwrap()
+                                       .create_resource::<ServerOffer>(device.as_ref().version())
+                                       .unwrap();
+                             offer.quick_assign(|_, request, _| {
+                                      if let ServerOfferRequest::Receive { fd, .. } = request {
+                                          let mut write = unsafe { PipeWriter::from_raw_fd(fd) };
+                                          let _ = write.write_all(&[1, 3, 3, 7]);
+                                      }
+                                  });
+                             device.data_offer(&offer);
+                             offer.offer("application/octet-stream".to_string());
+                             device.selection(Some(&offer));
+                         }
+                         _ => unreachable!(),
+                     });
           });
 
     let socket_name = mem::replace(&mut server.socket_name, OsString::new());
